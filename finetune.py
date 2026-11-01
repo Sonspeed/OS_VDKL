@@ -39,6 +39,8 @@ from utils import get_tokenizer, get_model
 from distillm import forward_kl, reverse_kl, js_distance, tv_distance, ab_div, AKL, alphanet, bdkd
 from distillm import skewed_forward_kl, skewed_reverse_kl
 from distillm import SampleGenerator, ReplayBuffer
+from distillm import last_os_vdkl_metrics
+from os_vdkl.multi_lora import save_os_multi_lora, unwrap_model
 
 from rouge_metric import compute_metrics
 
@@ -144,12 +146,22 @@ def prepare_dataset(args, tokenizer):
 
 
 def pt_loss(args, model, model_batch, no_model_batch):
-    loss_mask = (no_model_batch["label"] != -100).int()
-    outputs = model(**model_batch, return_dict=True, use_cache=False)
-    logits = outputs.logits
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-    lm_loss = loss_fn(logits.view(-1, logits.size(-1)), no_model_batch["label"].view(-1))
-    return lm_loss
+    core = unwrap_model(model) if getattr(args, "os_vdkl", False) else None
+    previous_mode = getattr(core, "os_decode_mode", None) if core is not None else None
+    if core is not None and hasattr(core, "os_decode_mode"):
+        # Pretraining CE is on the coupled mixture, the same predictive distribution as L_global.
+        core.os_decode_mode = "mixture"
+        core.os_branch_ids = None
+        core.os_force_branch = None
+    try:
+        outputs = model(**model_batch, return_dict=True, use_cache=False)
+        logits = outputs.logits
+        loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        lm_loss = loss_fn(logits.view(-1, logits.size(-1)), no_model_batch["label"].view(-1))
+        return lm_loss
+    finally:
+        if core is not None and previous_mode is not None:
+            core.os_decode_mode = previous_mode
 
 
 def symmetrize_and_selfloop(coo: torch.sparse_coo_tensor, self_val: float = 1.0):
@@ -257,7 +269,7 @@ def get_sparse_cost_kernel(args, model, teacher_model, device):
     return mat_K, mat_Kt
 
 
-def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model_batch, logits, epoch, mat_K=None, mat_Kt=None):
+def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model_batch, logits, epoch, mat_K=None, mat_Kt=None, outputs=None):
     with torch.no_grad():
         teacher_model.eval()
         teacher_outputs = teacher_model(**model_batch, use_cache=False)
@@ -265,6 +277,9 @@ def get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model
     if args.model_parallel:
         raise NotImplementedError
     else:
+        if getattr(args, "os_vdkl", False) or (isinstance(args.type, str) and "os-vdkl" in args.type):
+            from distillm.losses import os_vdkl_loss
+            return os_vdkl_loss(args, outputs if outputs is not None else logits, teacher_logits, no_model_batch, model)
         if "sfkl" in args.type:
             distil_loss = skewed_forward_kl(logits, teacher_logits, no_model_batch, lam=args.skew_alpha)
         elif "srkl" in args.type:
@@ -355,8 +370,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     replay_buffer = ReplayBuffer(args)
 
     total_res = []
+    os_metric_sums = {}
+    os_metric_steps = 0
+    metric_suffix = ""
 
-    if args.amid_div_name in ['wass', 'sink']:
+    if args.amid_div_name in ['wass', 'sink'] and not getattr(args, "os_vdkl", False):
         mat_K, mat_Kt = get_sparse_cost_kernel(args, model, teacher_model, device)
     else:
         mat_K, mat_Kt = None, None
@@ -420,6 +438,14 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
                     model.train()
 
+            if getattr(args, "os_vdkl", False):
+                os_core = unwrap_model(model)
+                if hasattr(os_core, "os_decode_mode"):
+                    # kd_ratio == 1 drops the token CE, so skip the mixture logits on this forward.
+                    os_core.os_decode_mode = "mixture" if args.kd_ratio is not None and args.kd_ratio < 1 else "base"
+                    os_core.os_branch_ids = None
+                    os_core.os_force_branch = None
+
             outputs = model(**model_batch, use_cache=False)
 
             logits = outputs.logits
@@ -429,7 +455,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 lm_loss = loss_func(logits.float().view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
 
             if teacher_model is not None:
-                distil_loss = get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model_batch, logits, epoch, mat_K=mat_K, mat_Kt=mat_Kt)
+                distil_loss = get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model_batch, logits, epoch, mat_K=mat_K, mat_Kt=mat_Kt, outputs=outputs)
                 loss = (1 - args.kd_ratio) * lm_loss + args.kd_ratio * distil_loss
             else:
                 loss = lm_loss
@@ -457,8 +483,20 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             total_time += elapsed_time
 
             # Logging
+            if getattr(args, "os_vdkl", False) and teacher_model is not None:
+                os_metrics = last_os_vdkl_metrics()
+                if os_metrics:
+                    os_metric_steps += 1
+                    for key, value in os_metrics.items():
+                        os_metric_sums[key] = os_metric_sums.get(key, 0.0) + value
+                    metric_suffix = " | " + " ".join(f"{key}: {value:.4f}" for key, value in os_metrics.items())
+                else:
+                    metric_suffix = ""
+            else:
+                metric_suffix = ""
+
             def get_log(log_loss, log_distil_loss, log_time):
-                return "train | epoch {:3d} | Iter: {:6d}/{:6d} | global iter: {:6d}/{:6d} | loss: {:.4f} | ds_loss: {:.4f} | lr: {:.4e} | scale: {:10.4f} | micro time: {:.3f} | step time: {:.3f}".format(
+                return ("train | epoch {:3d} | Iter: {:6d}/{:6d} | global iter: {:6d}/{:6d} | loss: {:.4f} | ds_loss: {:.4f} | lr: {:.4e} | scale: {:10.4f} | micro time: {:.3f} | step time: {:.3f}".format(
                     epoch,
                     step,
                     args.total_iters * args.gradient_accumulation_steps,
@@ -470,7 +508,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                     optimizer.cur_scale if hasattr(optimizer, "cur_scale") else 0,
                     elapsed_time,
                     log_time,
-                )
+                ) + metric_suffix)
 
             if args.mid_log_num > 0:
                 mid_log_step = args.gradient_accumulation_steps // args.mid_log_num
@@ -479,6 +517,15 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                     print_rank(get_log(global_loss, global_distil_loss, 0))
 
             if global_step % args.log_interval == 0 and step % args.gradient_accumulation_steps == 0:
+                if os_metric_steps > 0:
+                    averaged = {key: value / os_metric_steps for key, value in os_metric_sums.items()}
+                    metric_suffix = " | " + " ".join(f"{key}: {value:.4f}" for key, value in averaged.items())
+                    try:
+                        import wandb
+                        if getattr(wandb, "run", None) is not None:
+                            wandb.log({f"os_vdkl/{key}": value for key, value in averaged.items()}, step=global_step)
+                    except Exception:
+                        pass
                 log_str = get_log(total_loss / (args.log_interval * args.gradient_accumulation_steps), total_distil_loss / (args.log_interval * args.gradient_accumulation_steps), total_time / (args.log_interval))
                 print_rank("*" * 100)
                 print_rank(log_str)
@@ -486,6 +533,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 print_rank("*" * 100)
                 save_rank(log_str, os.path.join(args.save, "log.txt"))
                 total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
+                os_metric_sums = {}
+                os_metric_steps = 0
+                metric_suffix = ""
 
             # Checkpointing
             if args.save and args.save_interval and global_step % args.save_interval == 0 and step % args.gradient_accumulation_steps == 0:
@@ -498,6 +548,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                         print_rank(f"Model save to {save_dir_path}")
                         tokenizer.save_pretrained(save_dir_path)
                         model.module.save_pretrained(save_dir_path, safe_serialization=False)
+                        save_os_multi_lora(model.module, save_dir_path, args)
                 dist.barrier()
 
             # Evaluation
@@ -540,6 +591,13 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
         loss_func = nn.CrossEntropyLoss()
 
     print_rank("dp size", dp_world_size)
+
+    if getattr(args, "os_vdkl", False):
+        os_core = unwrap_model(model)
+        if hasattr(os_core, "os_decode_mode"):
+            os_core.os_decode_mode = "mixture"
+            os_core.os_branch_ids = None
+            os_core.os_force_branch = None
 
     generation_config = GenerationConfig(
         do_sample=args.do_sample,

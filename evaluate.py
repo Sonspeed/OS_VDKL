@@ -80,7 +80,11 @@ def main():
     else:
         raise NotImplementedError
     model = setup_model(args, ds_config, device)
-    
+    if getattr(args, "os_vdkl", False):
+        print_rank(
+            f"OS-VDKL evaluation | mode {args.os_eval_mode} | branches {args.os_num_branches} | rank {args.os_lora_rank}"
+        )
+
     if args.type == "eval_main":
         evaluate_main(args, tokenizer, model, dataset["test"], "test", 0, device)
     else:

@@ -49,8 +49,22 @@ class SampleGenerator():
             "no_model_batch": torch.ones(bs, self.args.max_length, dtype=torch.long, device=gen_data["input_ids"].device) * -100,
         }
         
+        from contextlib import nullcontext
+        decode_ctx = nullcontext()
+        if getattr(self.args, "os_vdkl", False):
+            from os_vdkl.multi_lora import os_decode_context, unwrap_model
+            core = unwrap_model(model)
+            if hasattr(core, "os_lora_A"):
+                if getattr(self.args, "os_sgo_mode", "random_branch") == "random_branch":
+                    branch_ids = torch.randint(
+                        0, int(core.os_lora_A.size(0)), (bs,), device=gen_data["input_ids"].device,
+                    )
+                    decode_ctx = os_decode_context(model, "random_branch", branch_ids=branch_ids)
+                else:
+                    decode_ctx = os_decode_context(model, "mixture")
+
         model.eval()
-        with torch.no_grad():
+        with decode_ctx, torch.no_grad():
             cur_input_len = gen_data["input_ids"].size(1)
             max_new_tokens = max(1, self.args.max_length - cur_input_len)
 

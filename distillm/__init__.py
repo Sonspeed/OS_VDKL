@@ -4,3 +4,4 @@ from .sampler import SampleGenerator
 from .buffer import ReplayBuffer
 
 from .losses import amid
+from .losses import os_vdkl_loss, last_os_vdkl_metrics

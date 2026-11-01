@@ -1,7 +1,9 @@
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def ab_div(logits, teacher_logits, no_model_batch, alpha, beta):
@@ -532,3 +534,213 @@ def amid(logits, teacher_logits, no_model_batch, args, mat_K=None, mat_Kt=None, 
 
     else:
         raise ValueError(f"Unknown amid-div-name: {div_name}")
+
+
+_OS_VDKL_METRICS = {}
+
+
+def last_os_vdkl_metrics():
+    """Most recent OS-VDKL diagnostics (python floats), empty if none yet."""
+    return dict(_OS_VDKL_METRICS)
+
+
+def log_domain_sinkhorn(cost, log_target, eps, iters):
+    """Log-domain Sinkhorn on an ``M x K`` cost.
+
+    ``cost`` is ``[N, M, K]`` and ``log_target`` is ``log P_hat`` with shape
+    ``[N, M]`` or ``[N, M, 1]``. Returns the row-stochastic plan ``gamma``
+    (``sum_k gamma = 1``). The column update enforces
+    ``sum_y P(y) gamma_k(y) = 1/K`` at the fixed point.
+    """
+    if log_target.dim() == 2:
+        log_target = log_target.unsqueeze(-1)
+    phi = -cost / eps
+    log_k = math.log(cost.size(-1))
+    for _ in range(int(iters)):
+        phi = phi - torch.logsumexp(phi, dim=2, keepdim=True)
+        phi = phi - torch.logsumexp(phi + log_target, dim=1, keepdim=True) - log_k
+    return torch.softmax(phi, dim=2)
+
+
+def subspace_ortho_penalty(lora_B):
+    """``sum_{i < j} || normalize(B_i)^T normalize(B_j) ||_F^2``."""
+    if lora_B.size(0) < 2:
+        return lora_B.float().sum() * 0.0
+    normalized = F.normalize(lora_B.float(), p=2, dim=1)
+    gram = torch.einsum("idr,jds->ijrs", normalized, normalized)
+    pairs = torch.triu_indices(lora_B.size(0), lora_B.size(0), offset=1, device=lora_B.device)
+    return (gram[pairs[0], pairs[1]] ** 2).sum()
+
+
+def _dist_mean(value):
+    tensor = value.detach().float().reshape(())
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor = tensor / dist.get_world_size()
+    return tensor
+
+
+def _store_os_metrics(metrics):
+    global _OS_VDKL_METRICS
+    stored = {}
+    for key, value in metrics.items():
+        stored[key] = float(_dist_mean(value).item())
+    _OS_VDKL_METRICS = stored
+
+
+def _os_token_losses(h0, teacher_logits, lora_A, lora_B, weight, factors, scale, temp, top_m, sink_eps, sink_iters, eta_sem):
+    """Global FKL plus decoupled local RKL on one chunk of active tokens."""
+    hidden = h0.float()
+    teacher = teacher_logits.detach().float()
+    branches_a = lora_A.float()
+    branches_b = lora_B.float()
+    head = weight.float()
+    factors = factors.float()
+    num_tokens = hidden.size(0)
+    num_branches = branches_a.size(0)
+    vocab = teacher.size(-1)
+    temperature = temp if temp > 0 else 1.0
+    support = max(1, min(int(top_m), vocab))
+
+    teacher_probs = torch.softmax(teacher / temperature, dim=-1)
+    base_logits = F.linear(hidden, head)
+    activation = torch.einsum("nd,krd->nkr", hidden, branches_a)
+    branch_logits = base_logits.unsqueeze(1) + scale * torch.einsum("nkr,krv->nkv", activation, factors)
+    log_branch = torch.log_softmax(branch_logits / temperature, dim=-1)
+    log_mixture = torch.logsumexp(log_branch, dim=1) - math.log(num_branches)
+    global_sum = -(teacher_probs * log_mixture).sum(dim=-1).sum()
+
+    with torch.no_grad():
+        entropy_branch = -(log_branch.exp() * log_branch).sum(dim=-1)
+        entropy_mixture = -(log_mixture.exp() * log_mixture).sum(dim=-1)
+        gain_sum = (entropy_mixture - entropy_branch.mean(dim=-1)).sum()
+
+    top_vals, top_idx = torch.topk(teacher_probs, k=support, dim=-1)
+    teacher_hat = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    activation_det = torch.einsum("nd,krd->nkr", hidden.detach(), branches_a)
+    delta_h = scale * torch.einsum("nkr,kdr->nkd", activation_det, branches_b)
+    head_support = head.detach()[top_idx]
+    base_support = torch.gather(base_logits.detach(), 1, top_idx)
+    local_logits = base_support.unsqueeze(2) + torch.einsum("nmd,nkd->nmk", head_support, delta_h)
+    log_local = torch.log_softmax(local_logits / temperature, dim=1)
+    local_probs = log_local.exp()
+
+    with torch.no_grad():
+        cost = -log_local
+        if eta_sem > 0:
+            head_norm = F.normalize(head_support.float(), p=2, dim=-1)
+            prototype = torch.einsum("nmk,nmd->nkd", local_probs, head_norm)
+            prototype = F.normalize(prototype, p=2, dim=-1)
+            cost = cost + eta_sem * (1.0 - torch.einsum("nmd,nkd->nmk", head_norm, prototype))
+        log_teacher_hat = torch.log(teacher_hat.clamp_min(1e-12))
+        gamma = log_domain_sinkhorn(cost, log_teacher_hat, sink_eps, sink_iters)
+        joint = gamma * teacher_hat.unsqueeze(-1)
+        local_target = joint / joint.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        if num_branches < 2:
+            tv_sum = local_probs.new_zeros(())
+        else:
+            tv_acc = local_probs.new_zeros(())
+            pairs = 0
+            for i in range(num_branches):
+                for j in range(i + 1, num_branches):
+                    tv_acc = tv_acc + (0.5 * (local_probs[..., i] - local_probs[..., j]).abs().sum(dim=-1)).sum()
+                    pairs += 1
+            tv_sum = tv_acc / pairs
+
+    local_sum = (local_probs * (log_local - torch.log(local_target.clamp_min(1e-12)))).sum()
+    return global_sum, local_sum, gain_sum, tv_sum
+
+
+def os_vdkl_loss_from_hidden(h0, teacher_logits, lora_A, lora_B, weight, args):
+    """OS-VDKL on active tokens.
+
+    ``h0`` is ``[N, d]`` and ``teacher_logits`` is ``[N, V]``. ``L_local`` is
+    computed from ``h0.detach()`` and ``W_head.detach()``, so it updates only
+    the branch factors.
+    """
+    num_tokens = h0.size(0)
+    if num_tokens == 0:
+        zero = lora_A.float().sum() * 0.0
+        _store_os_metrics({
+            "l_global": zero, "l_local": zero, "r_ortho": zero,
+            "entropy_gain": zero, "mean_tv": zero,
+        })
+        return {"loss": zero, "l_global": zero, "l_local": zero, "r_ortho": zero,
+                "entropy_gain": zero, "mean_tv": zero}
+
+    scale = float(args.os_lora_alpha) / float(args.os_lora_rank)
+    temp = float(getattr(args, "student_temp", 1.0))
+    chunk_tokens = max(1, int(getattr(args, "os_chunk_tokens", 32)))
+    factors = torch.einsum("vd,kdr->krv", weight.float(), lora_B.float())
+
+    global_sum = torch.zeros((), device=h0.device, dtype=torch.float32)
+    local_sum = torch.zeros((), device=h0.device, dtype=torch.float32)
+    gain_sum = torch.zeros((), device=h0.device, dtype=torch.float32)
+    tv_sum = torch.zeros((), device=h0.device, dtype=torch.float32)
+    use_ckpt = torch.is_grad_enabled() and (
+        h0.requires_grad or lora_A.requires_grad or lora_B.requires_grad or weight.requires_grad
+    )
+
+    def _run(h_chunk, t_chunk, a_param, b_param, w_param, u_param):
+        return _os_token_losses(
+            h_chunk, t_chunk, a_param, b_param, w_param, u_param, scale, temp,
+            args.os_top_m, args.os_sinkhorn_eps, args.os_sinkhorn_iters, args.os_eta_sem,
+        )
+
+    for start in range(0, num_tokens, chunk_tokens):
+        end = min(num_tokens, start + chunk_tokens)
+        inputs = (h0[start:end], teacher_logits[start:end], lora_A, lora_B, weight, factors)
+        if use_ckpt and (end - start) < num_tokens:
+            g_sum, l_sum, e_sum, t_sum = checkpoint(_run, *inputs, use_reentrant=False)
+        else:
+            g_sum, l_sum, e_sum, t_sum = _run(*inputs)
+        global_sum = global_sum + g_sum
+        local_sum = local_sum + l_sum
+        gain_sum = gain_sum + e_sum
+        tv_sum = tv_sum + t_sum
+
+    l_global = global_sum / num_tokens
+    l_local = local_sum / (num_tokens * lora_A.size(0))
+    r_ortho = subspace_ortho_penalty(lora_B)
+    loss = l_global + float(args.os_lambda_local) * l_local + float(args.os_mu_ortho) * r_ortho
+    entropy_gain = gain_sum / num_tokens
+    mean_tv = tv_sum / num_tokens
+    parts = {
+        "loss": loss,
+        "l_global": l_global,
+        "l_local": l_local,
+        "r_ortho": r_ortho,
+        "entropy_gain": entropy_gain,
+        "mean_tv": mean_tv,
+    }
+    _store_os_metrics({k: parts[k] for k in ("l_global", "l_local", "r_ortho", "entropy_gain", "mean_tv")})
+    return parts
+
+
+def os_vdkl_loss(args, logits_or_outputs, teacher_logits, no_model_batch, student_model=None):
+    """Full-vocabulary mixture FKL + top-M dual-KL local RKL + Stiefel penalty."""
+    from os_vdkl.multi_lora import head_weight, unwrap_model
+
+    model = unwrap_model(student_model)
+    if torch.is_tensor(logits_or_outputs):
+        hidden = getattr(model, "_os_h0", None) if model is not None else None
+        if hidden is None:
+            raise RuntimeError("OS-VDKL needs the student final hidden state h0.")
+    else:
+        hidden = getattr(logits_or_outputs, "os_h0", None)
+        if hidden is None and getattr(logits_or_outputs, "hidden_states", None):
+            hidden = logits_or_outputs.hidden_states[-1]
+        if hidden is None and model is not None:
+            hidden = getattr(model, "_os_h0", None)
+        if hidden is None:
+            raise RuntimeError("OS-VDKL needs the student final hidden state h0.")
+
+    labels = no_model_batch["label"]
+    length = min(hidden.size(1), teacher_logits.size(1), labels.size(1))
+    hidden = hidden[:, :length]
+    teacher = teacher_logits[:, :length]
+    mask = labels[:, :length] != -100
+    parts = os_vdkl_loss_from_hidden(
+        hidden[mask], teacher[mask].float(), model.os_lora_A, model.os_lora_B, head_weight(model), args,
+    )
+    return parts["loss"]

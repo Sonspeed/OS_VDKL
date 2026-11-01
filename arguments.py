@@ -274,6 +274,28 @@ def add_wd_args(parser: argparse.ArgumentParser):
     return parser
 
 
+def add_os_vdkl_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group("os_vdkl", "OS-VDKL configurations")
+
+    group.add_argument("--os-vdkl", action="store_true",
+                       help="enable Orthogonal-Subspace Variational Dual-KL distillation")
+    group.add_argument("--os-num-branches", type=int, default=3)
+    group.add_argument("--os-top-m", type=int, default=64)
+    group.add_argument("--os-lora-rank", type=int, default=16)
+    group.add_argument("--os-lora-alpha", type=float, default=16.0)
+    group.add_argument("--os-init-scale", type=float, default=0.02)
+    group.add_argument("--os-sinkhorn-eps", type=float, default=0.05)
+    group.add_argument("--os-sinkhorn-iters", type=int, default=5)
+    group.add_argument("--os-lambda-local", type=float, default=0.5)
+    group.add_argument("--os-mu-ortho", type=float, default=0.1)
+    group.add_argument("--os-eta-sem", type=float, default=0.05)
+    group.add_argument("--os-sgo-mode", type=str, default="random_branch",
+                       choices=["mixture", "random_branch"])
+    group.add_argument("--os-eval-mode", type=str, default="all",
+                       choices=["mixture", "all"])
+    return parser
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser = add_model_args(parser)
@@ -289,6 +311,7 @@ def get_args():
     parser = add_ab_args(parser)
     parser = add_amid_args(parser)
     parser = add_wd_args(parser)
+    parser = add_os_vdkl_args(parser)
 
     args, unknown = parser.parse_known_args()
 

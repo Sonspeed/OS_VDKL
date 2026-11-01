@@ -173,7 +173,16 @@ def get_model(args, device):
     ed_time = time.time()
     
     print_rank(f"Model load time: {ed_time - st_time}s")
-    
+
+    from os_vdkl.multi_lora import attach_os_multi_lora
+    model = attach_os_multi_lora(model, args)
+    if getattr(args, "os_vdkl", False) and dist.get_rank() == 0:
+        branch_params = model.os_lora_A.numel() + model.os_lora_B.numel()
+        print(
+            f" > os-vdkl parameters: {branch_params} (K={args.os_num_branches}, r={args.os_lora_rank})",
+            flush=True,
+        )
+
     return model
 
 
