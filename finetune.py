@@ -49,6 +49,124 @@ from peft import PeftModel
 torch.set_num_threads(4)
 
 
+def format_duration(seconds):
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    seconds = int(round(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    chunks = []
+    if days:
+        chunks.append(f"{days}d")
+    if days or hours:
+        chunks.append(f"{hours}h")
+    if days or hours or minutes:
+        chunks.append(f"{minutes}m")
+    chunks.append(f"{secs}s")
+    return "".join(chunks)
+
+
+def build_time_estimate(args, dataset, global_step, step_time_sum, step_time_count):
+    """Wall-time estimate from measured optimizer steps and validation passes."""
+    if step_time_count <= 0:
+        return None
+    avg_step = step_time_sum / step_time_count
+    remaining = max(int(args.total_iters) - int(global_step), 0)
+    epochs = int(args.estimate_epochs) if getattr(args, "estimate_epochs", None) else int(args.epochs)
+    steps_per_epoch = int(args.train_iters_per_epoch)
+    full_steps = steps_per_epoch * epochs
+    eval_times = list(getattr(args, "eval_time_history", []) or [])
+    measured_eval = float(np.mean(eval_times)) if eval_times else 0.0
+    measured_dev = len(dataset["dev"]) if dataset is not None and "dev" in dataset else 0
+    target_dev = int(args.estimate_dev_num) if getattr(args, "estimate_dev_num", None) else measured_dev
+    eval_scale = (float(target_dev) / float(measured_dev)) if measured_dev else 1.0
+    n_evals = epochs + 1
+    eval_seconds = measured_eval * eval_scale * n_evals
+    train_seconds = full_steps * avg_step
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    return {
+        "gpu": gpu_name,
+        "gpu_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        "batch_size": int(args.batch_size),
+        "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+        "avg_step_seconds": avg_step,
+        "measured_steps": int(step_time_count),
+        "warmup_steps_excluded": 1,
+        "this_run_total_steps": int(args.total_iters),
+        "this_run_remaining_steps": remaining,
+        "this_run_eta_seconds": remaining * avg_step,
+        "this_run_eta": format_duration(remaining * avg_step),
+        "steps_per_epoch": steps_per_epoch,
+        "full_epochs": epochs,
+        "full_steps": full_steps,
+        "full_train_seconds": train_seconds,
+        "full_train": format_duration(train_seconds),
+        "measured_eval_seconds": measured_eval,
+        "measured_dev_examples": int(measured_dev),
+        "scaled_dev_examples": int(target_dev),
+        "full_eval_count": n_evals,
+        "full_eval_seconds": eval_seconds,
+        "full_eval": format_duration(eval_seconds),
+        "full_eta_seconds": train_seconds + eval_seconds,
+        "full_eta": format_duration(train_seconds + eval_seconds),
+        "init_threshold": getattr(args, "init_threshold", None),
+        "notes": (
+            "Step time is the mean optimizer step after the first warmup step, "
+            "with the launcher's initial adaptive threshold. Those steps distill "
+            "the Dolly tokens and run the language-model forward. If the adaptive "
+            "threshold later triggers student sampling, those steps also generate "
+            "max_length - max_prompt_length tokens. Validation time is scaled from "
+            "the measured dev subset to scaled_dev_examples, counting the initial "
+            "validation plus one validation per epoch. The language-model batch uses "
+            "the same sequence length as a pretraining row."
+        ),
+    }
+
+
+def write_time_estimate(args, estimate):
+    if estimate is None or not getattr(args, "save", None):
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    path = os.path.join(args.save, "time_estimate.json")
+    with open(path, "w") as f:
+        json.dump(estimate, f, indent=2)
+        f.write("\n")
+    line = (
+        f"time estimate | gpu {estimate['gpu']} x{estimate['gpu_count']} | "
+        f"batch {estimate['batch_size']} | {estimate['avg_step_seconds']:.2f}s/step | "
+        f"this run eta {estimate['this_run_eta']} | "
+        f"full {estimate['full_epochs']} epochs ({estimate['full_steps']} steps, "
+        f"{estimate['steps_per_epoch']}/epoch) train {estimate['full_train']} + "
+        f"eval {estimate['full_eval']} = {estimate['full_eta']}"
+    )
+    print_rank(line)
+    save_rank(line, os.path.join(args.save, "log.txt"))
+    args.latest_time_estimate = estimate
+
+
+def save_student_checkpoint(args, tokenizer, model, save_dir):
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    print_rank(f"Model save to {save_dir}")
+    tokenizer.save_pretrained(save_dir)
+    core = model.module if hasattr(model, "module") else model
+    # Branch adapters live in os_multi_lora.pt. Keep them out of the HF
+    # state dict so AutoModelForCausalLM can load the distilled student.
+    held = {}
+    for name in ("os_lora_A", "os_lora_B"):
+        if name in getattr(core, "_parameters", {}):
+            held[name] = core._parameters.pop(name)
+    try:
+        core.save_pretrained(save_dir, safe_serialization=False)
+    finally:
+        for name, param in held.items():
+            core.register_parameter(name, param)
+    save_os_multi_lora(core, save_dir, args)
+
+
 def get_teacher_model(args, device):
     config = AutoConfig.from_pretrained(args.teacher_model_path)
     if args.model_parallel:
@@ -373,6 +491,15 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     os_metric_sums = {}
     os_metric_steps = 0
     metric_suffix = ""
+    step_time_sum = 0.0
+    step_time_count = 0
+    full_epochs = int(args.estimate_epochs) if getattr(args, "estimate_epochs", None) else int(args.epochs)
+    print_rank(
+        f"time estimate | this run {args.total_iters} steps | "
+        f"{args.train_iters_per_epoch} steps/epoch | "
+        f"full schedule {full_epochs} epochs | "
+        f"ETA starts after the warmup step"
+    )
 
     if args.amid_div_name in ['wass', 'sink'] and not getattr(args, "os_vdkl", False):
         mat_K, mat_Kt = get_sparse_cost_kernel(args, model, teacher_model, device)
@@ -481,6 +608,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
             total_loss += global_loss
             total_time += elapsed_time
+            if global_step > 1:
+                step_time_sum += elapsed_time
+                step_time_count += 1
 
             # Logging
             if getattr(args, "os_vdkl", False) and teacher_model is not None:
@@ -526,6 +656,13 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                             wandb.log({f"os_vdkl/{key}": value for key, value in averaged.items()}, step=global_step)
                     except Exception:
                         pass
+                estimate = build_time_estimate(args, dataset, global_step, step_time_sum, step_time_count)
+                if estimate is not None:
+                    metric_suffix += (
+                        f" | eta {estimate['this_run_eta']} | "
+                        f"full {estimate['full_epochs']}ep {estimate['full_eta']}"
+                    )
+                    write_time_estimate(args, estimate)
                 log_str = get_log(total_loss / (args.log_interval * args.gradient_accumulation_steps), total_distil_loss / (args.log_interval * args.gradient_accumulation_steps), total_time / (args.log_interval))
                 print_rank("*" * 100)
                 print_rank(log_str)
@@ -542,13 +679,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 save_dir_path = os.path.join(args.save, str(global_step))
                 if args.model_parallel:
                     raise NotImplementedError
-                else:
-                    if dist.get_rank() == 0:
-                        os.makedirs(save_dir_path, exist_ok=True)
-                        print_rank(f"Model save to {save_dir_path}")
-                        tokenizer.save_pretrained(save_dir_path)
-                        model.module.save_pretrained(save_dir_path, safe_serialization=False)
-                        save_os_multi_lora(model.module, save_dir_path, args)
+                save_student_checkpoint(args, tokenizer, model, save_dir_path)
                 dist.barrier()
 
             # Evaluation
@@ -569,17 +700,36 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
             if global_step > args.total_iters:
                 break
+        else:
+            continue
+        break
 
-    ##### Save #####
-    # total_res = np.array(total_res)
-    # best_res = total_res[np.argmax(total_res[:, -1])]
-    # save_rank(f"best | step: {best_res[0]}, avg_loss: {best_res[1]}, exact_match: {best_res[2]}, rougeL: {best_res[3]}", os.path.join(args.save, "log.txt"))
-    # np.save(f"{args.save}/total_res#best_{best_res[0]}_{best_res[-1]:.2f}.npy", np.array(total_res))
+    if args.save:
+        final_dir = os.path.join(args.save, "final")
+        if args.model_parallel:
+            raise NotImplementedError
+        save_student_checkpoint(args, tokenizer, model, final_dir)
+        if dist.get_rank() == 0:
+            estimate = build_time_estimate(
+                args, dataset, min(global_step, args.total_iters), step_time_sum, step_time_count,
+            )
+            if estimate is not None:
+                with open(os.path.join(final_dir, "time_estimate.json"), "w") as handle:
+                    json.dump(estimate, handle, indent=2)
+                    handle.write("\n")
+                write_time_estimate(args, estimate)
+        dist.barrier()
+        if getattr(args, "hf_repo", None):
+            if dist.get_rank() == 0:
+                from os_vdkl.publish import push_checkpoint
+                push_checkpoint(final_dir, args.hf_repo, private=bool(getattr(args, "hf_private", False)))
+            dist.barrier()
 
     return model
 
 
 def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, device, adaptive_threshold=None):
+    eval_t0 = time.time()
     collate_fn = dataset.collate
 
     if args.model_parallel:
@@ -678,6 +828,13 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
             log_str = f"{split} | avg_loss: {avg_loss} | {res}"
         print_rank(log_str)
         save_rank(log_str, os.path.join(args.save, "log.txt"))
+
+    eval_seconds = time.time() - eval_t0
+    history = getattr(args, "eval_time_history", None)
+    if history is None:
+        args.eval_time_history = []
+    args.eval_time_history.append(eval_seconds)
+    print_rank(f"eval wall time: {format_duration(eval_seconds)} ({eval_seconds:.1f}s) over {step} batches, {len(dataset)} examples")
 
     return all_loss / step # , [avg_loss, res["exact_match"], res["rougeL"]]
 

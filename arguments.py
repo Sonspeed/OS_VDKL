@@ -293,6 +293,14 @@ def add_os_vdkl_args(parser: argparse.ArgumentParser):
                        choices=["mixture", "random_branch"])
     group.add_argument("--os-eval-mode", type=str, default="all",
                        choices=["mixture", "all"])
+    group.add_argument("--hf-repo", type=str, default=None,
+                       help="Hugging Face model repo for the final checkpoint, e.g. os_vdkl/gpt2-0.1B-os-vdkl")
+    group.add_argument("--hf-private", action="store_true",
+                       help="create the Hugging Face repo as private")
+    group.add_argument("--estimate-epochs", type=int, default=None,
+                       help="report wall time for this many full epochs at the current batch size")
+    group.add_argument("--estimate-dev-num", type=int, default=None,
+                       help="scale the measured validation time up to this many dev examples")
     return parser
 
 
