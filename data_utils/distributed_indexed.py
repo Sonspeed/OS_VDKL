@@ -53,6 +53,10 @@ def data_file_path(prefix_path):
     return prefix_path + '.bin'
 
 
+def source_prefix(path, name, state):
+    return os.path.join(path, f"{name}_{state}")
+
+
 class DistributedMMapIndexedDataset(torch.utils.data.Dataset):
     class Index(object):
         _HDR_MAGIC = b'MMIDIDX\x00\x00'
@@ -136,7 +140,7 @@ class DistributedMMapIndexedDataset(torch.utils.data.Dataset):
         state = 0
         history = {-1:(0, 0)}
         for state in range(np.iinfo(np.int32).max):
-            source_file = path + name + f"_{state}"
+            source_file = source_prefix(path, name, state)
             if self.exists(source_file):
                 index = self.Index(index_file_path(source_file))
                 history[state] = (history[state-1][1], history[state-1][1] + len(index))
@@ -148,7 +152,7 @@ class DistributedMMapIndexedDataset(torch.utils.data.Dataset):
         return state, history
 
     def __getstate__(self):
-        return self._path + self._name + "_%d"%(self._state)
+        return source_prefix(self._path, self._name, self._state)
 
     def __setstate__(self, state):
         self._state = state
@@ -163,7 +167,7 @@ class DistributedMMapIndexedDataset(torch.utils.data.Dataset):
 
         self._state = state
 
-        source_file = path + name + f"_{self._state}"
+        source_file = source_prefix(path, name, self._state)
         self._index = self.Index(index_file_path(source_file))
         self._bin_buffer_mmap = np.memmap(data_file_path(source_file), mode='r', order='C')
         self._bin_buffer = memoryview(self._bin_buffer_mmap)

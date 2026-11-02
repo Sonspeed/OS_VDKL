@@ -1,5 +1,6 @@
 import time
 import os
+import sys
 
 import numpy as np
 import torch
@@ -493,6 +494,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     metric_suffix = ""
     step_time_sum = 0.0
     step_time_count = 0
+    opt_time = 0.0
+    progress_lines = dp_rank == 0 and os.environ.get("OS_VDKL_PROGRESS") == "1"
+    train_bar = None
     full_epochs = int(args.estimate_epochs) if getattr(args, "estimate_epochs", None) else int(args.epochs)
     print_rank(
         f"time estimate | this run {args.total_iters} steps | "
@@ -500,6 +504,10 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         f"full schedule {full_epochs} epochs | "
         f"ETA starts after the warmup step"
     )
+    if progress_lines:
+        print(f"@@progress_total {int(args.total_iters)}", flush=True)
+    elif dp_rank == 0 and sys.stderr.isatty():
+        train_bar = tqdm(total=int(args.total_iters), desc="train", unit="step", dynamic_ncols=True, file=sys.stderr)
 
     if args.amid_div_name in ['wass', 'sink'] and not getattr(args, "os_vdkl", False):
         mat_K, mat_Kt = get_sparse_cost_kernel(args, model, teacher_model, device)
@@ -608,6 +616,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
             total_loss += global_loss
             total_time += elapsed_time
+            opt_time += elapsed_time
             if global_step > 1:
                 step_time_sum += elapsed_time
                 step_time_count += 1
@@ -697,12 +706,31 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             step += 1
             if step % args.gradient_accumulation_steps == 0:
                 global_step += 1
+                done = global_step - 1
+                if progress_lines:
+                    lr_now = lr_scheduler.get_last_lr()[0]
+                    print(
+                        f"@@progress {done} {int(args.total_iters)} {global_loss:.4f} {global_distil_loss:.4f} {lr_now:.4e} {opt_time:.3f}",
+                        flush=True,
+                    )
+                elif train_bar is not None:
+                    train_bar.update(1)
+                    train_bar.set_postfix(
+                        loss=f"{global_loss:.4f}",
+                        ds=f"{global_distil_loss:.4f}",
+                        lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                        sec=f"{opt_time:.1f}",
+                    )
+                opt_time = 0.0
 
             if global_step > args.total_iters:
                 break
         else:
             continue
         break
+
+    if train_bar is not None:
+        train_bar.close()
 
     if args.save:
         final_dir = os.path.join(args.save, "final")
